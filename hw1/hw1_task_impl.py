@@ -1,4 +1,5 @@
 import torch
+from statistics import median
 
 
 # ============================================================================
@@ -12,8 +13,11 @@ import torch
 
 def lowest_ai_fn(x: torch.Tensor) -> torch.Tensor:
     """Lowest arithmetic intensity baseline (0 FLOP/Byte)."""
-    # TODO (1 line): implement a lowest-AI op
-    pass
+    # clone() copies the tensor to a new output tensor.
+    # That means the GPU mostly reads x and writes the result; it does not do
+    # meaningful floating-point arithmetic. This is a good "memory traffic only"
+    # baseline for the left side of the roofline plot.
+    return x.clone()
 
 
 # TASK 1b: Implement a function with configurable arithmetic intensity.
@@ -37,10 +41,20 @@ def make_compute_fn(num_ops: int, compiled: bool = True):
     """Return an eager or compiled function whose work scales with num_ops."""
 
     def fn(x: torch.Tensor) -> torch.Tensor:
-        pass
+        # acc is the running per-element value. Each loop iteration performs:
+        #   1 multiply: acc * x
+        #   1 add:      (...) + x
+        # So each iteration contributes 2 FLOPs per tensor element.
+        acc = x
+        for _ in range(num_ops):
+            acc = acc * x + x
+        return acc
 
-    # TODO (1 line): return either `fn` or `torch.compile(fn)` based on `compiled`
-    pass
+    # In eager mode, PyTorch usually launches separate kernels for the multiply
+    # and add operations. In compiled mode, torch.compile can fuse the whole
+    # pointwise chain into a much smaller number of kernels, often one kernel.
+    # That fusion is the reason compiled arithmetic intensity grows with num_ops.
+    return torch.compile(fn) if compiled else fn
 
 
 # ============================================================================
@@ -62,8 +76,26 @@ def benchmark_fn(fn, *args, warmup=25, rep=100) -> float:
         fn(*args)
     torch.cuda.synchronize()
 
-    # TODO: time `rep` runs using CUDA events and return median latency (ms)
-    pass
+    # CUDA kernels launch asynchronously: the CPU can continue before the GPU
+    # has finished the work. CUDA events are recorded on the GPU timeline, so
+    # elapsed_time() measures GPU execution time instead of Python wall-clock
+    # overhead.
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+
+    for i in range(rep):
+        # Record one start/end event pair around each invocation. The actual
+        # timing values are only valid after the final synchronize below.
+        start_events[i].record()
+        fn(*args)
+        end_events[i].record()
+
+    torch.cuda.synchronize()
+    times_ms = [start.elapsed_time(end) for start, end in zip(start_events, end_events)]
+
+    # The median is more stable than the mean when one run is unusually slow
+    # because of a transient system effect.
+    return median(times_ms)
 
 
 # TASK 3: Compute element-wise operation metrics from measured runtime.
@@ -83,8 +115,33 @@ def benchmark_fn(fn, *args, warmup=25, rep=100) -> float:
 
 
 def compute_elementwise_metrics(num_elements, num_ops, bytes_per_element, ms, variant):
-    # TODO: compute total FLOPs, arithmetic intensity, and achieved FLOP/s
-    pass
+    # The loop body is `acc = acc * x + x`.
+    # Per element, per loop iteration:
+    #   multiply = 1 FLOP
+    #   add      = 1 FLOP
+    # Therefore total FLOPs = 2 * number of elements * number of iterations.
+    total_flops = 2 * num_elements * num_ops
+
+    if variant == "compiled":
+        # Fused compiled model:
+        # torch.compile can keep intermediate values inside registers. At the
+        # kernel boundary, the idealized traffic is just one read of x and one
+        # write of the final output.
+        total_bytes = 2 * num_elements * bytes_per_element
+    elif variant == "eager":
+        # Eager model:
+        # Each loop iteration is approximated as two separate pointwise kernels:
+        #   multiply: read acc, read x, write intermediate = 3 element transfers
+        #   add:      read intermediate, read x, write acc = 3 element transfers
+        # That gives 6 element transfers per iteration.
+        total_bytes = 6 * num_elements * bytes_per_element * num_ops
+    else:
+        raise ValueError(f"Unknown element-wise variant: {variant}")
+
+    # Arithmetic intensity says how much computation we get per byte moved.
+    # Achieved FLOP/s says how much arithmetic the measured runtime delivered.
+    ai = total_flops / total_bytes
+    achieved_flops = total_flops / (ms * 1e-3)
     return total_flops, ai, achieved_flops
 
 
