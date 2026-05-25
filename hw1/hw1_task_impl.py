@@ -153,13 +153,42 @@ def compute_elementwise_metrics(num_elements, num_ops, bytes_per_element, ms, va
 # Q1. Look at the compiled element-wise operations from `1 ops` through `64 ops`.
 # Why does performance rise as arithmetic intensity increases even though the
 # measured runtime changes only a little?
+# A1. In the compiled version, torch.compile fuses the element-wise chain, so the
+# kernel still mostly reads the input once and writes the output once. As num_ops
+# increases, the number of FLOPs per element grows, but the boundary memory
+# traffic stays about the same. In my run, the compiled timings from 1 to 64 ops
+# stayed around 0.366-0.368 ms, while arithmetic intensity rose from 0.25 to
+# 16 FLOP/Byte and achieved throughput rose from about 0.37 to 23.37 TFLOP/s.
+# The GPU is doing more useful arithmetic during nearly the same memory pass.
 #
 # Q2. In one sample run, `matmul 1024x1024` achieved lower FLOP/s than the
 # `128 ops` compiled element-wise operation. Give one or two reasons why that can
 # happen on a large GPU like an H100.
+# A2. A 1024x1024 matrix multiply can be too small to fully occupy a very large
+# GPU, so fixed overheads and imperfect occupancy can reduce achieved FLOP/s.
+# Library matmul kernels also have tiling, scheduling, and memory-hierarchy costs
+# that may not be fully amortized at that size. By contrast, the compiled
+# element-wise benchmark runs over a huge 64M-element vector, which exposes a lot
+# of parallel work and can keep many SMs busy. In my Blackwell run, matmul 1024
+# was slightly higher than compiled 128 ops, but the same explanation applies to
+# runs where the small matmul point falls below it.
 #
 # Q3. Between `64 ops` and `128 ops`, runtime increases more noticeably than it
 # did for smaller operations. What does that suggest about what resource is
 # becoming the bottleneck?
+# A3. On the H100-calibrated roofline, 64 ops has AI around 16 and 128 ops has AI
+# around 32, so this range crosses the H100 ridge point near 20 FLOP/Byte. A more
+# noticeable runtime increase there suggests the kernel is moving out of the
+# purely memory-bound region and compute throughput is becoming the limiting
+# resource. In my RTX PRO 6000 Blackwell run, the ridge point is higher
+# (about 75 FLOP/Byte), so 128 ops at AI=32 is still below the ridge; the measured
+# time only changed slightly from 0.3675 ms to 0.3683 ms.
 #
 # Q4. Why do the eager `ops-K` points look so different from the compiled ones?
+# A4. In eager PyTorch, each multiply and add is launched as separate pointwise
+# work and intermediate tensors are materialized in global memory. That means
+# increasing K adds both FLOPs and a lot of extra memory traffic, so the estimated
+# arithmetic intensity stays low at about 0.083 FLOP/Byte in this model. With
+# torch.compile, the chain can be fused, intermediates can stay in registers, and
+# memory traffic is closer to one read plus one write; therefore the compiled
+# points move right as K increases and achieve much higher FLOP/s.
